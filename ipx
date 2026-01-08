@@ -112,8 +112,13 @@ list_banned() {
     local count=0
     local temp_file="/tmp/ipx_banned_temp"
     
-    # Ambil daftar IP dari iptables
-    iptables -L INPUT -n -v | grep DROP | grep -v "0.0.0.0/0" | awk '{print $8}' | grep -E '^[0-9]' > "$temp_file"
+    # Ambil daftar IP dari iptables - perbaikan untuk mendapatkan source IP
+    iptables -L INPUT -n -v --line-numbers | grep DROP | awk '{print $9}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' > "$temp_file"
+    
+    # Jika metode pertama gagal, coba metode alternatif
+    if [ ! -s "$temp_file" ]; then
+        iptables -S INPUT | grep "DROP" | grep -oP '(?<=-s )[0-9.]+' > "$temp_file"
+    fi
     
     if [ ! -s "$temp_file" ]; then
         echo "  ℹ️  Tidak ada IP yang ter-banned"
@@ -122,7 +127,7 @@ list_banned() {
     fi
     
     while read -r ip; do
-        if [ -n "$ip" ]; then
+        if [ -n "$ip" ] && [ "$ip" != "0.0.0.0" ]; then
             count=$((count + 1))
             
             # Cek apakah ada auto-unban scheduled
@@ -166,8 +171,17 @@ check_status() {
     echo "🔍 Status IP: $ip"
     echo "================================"
     
-    # Cek apakah ter-banned
-    if iptables -L INPUT -n | grep -q "$ip"; then
+    # Cek apakah ter-banned - perbaikan untuk memeriksa IP
+    local is_banned=0
+    
+    # Cek dengan beberapa metode
+    if iptables -L INPUT -n -v | grep DROP | grep -q "$ip"; then
+        is_banned=1
+    elif iptables -S INPUT | grep -q "\-s $ip"; then
+        is_banned=1
+    fi
+    
+    if [ $is_banned -eq 1 ]; then
         echo "Status: 🔴 BANNED"
         
         # Cek tipe ban
