@@ -1,0 +1,293 @@
+#!/bin/bash
+
+# IP Ban Manager Script
+# Usage: ipx -ip <IP_ADDRESS> -banned|-unbanned [-time <MINUTES>]
+
+CRON_FILE="/tmp/ipx_unban_jobs"
+BANNED_LIST="/var/log/ipx_banned.log"
+
+# Fungsi untuk menampilkan bantuan
+show_help() {
+    echo "IP Ban Manager - ipx"
+    echo ""
+    echo "Penggunaan:"
+    echo "  ipx -ip <IP_ADDRESS> -banned [-time <MENIT>]"
+    echo "  ipx -ip <IP_ADDRESS> -unbanned"
+    echo "  ipx -ip <IP_ADDRESS> -status"
+    echo "  ipx -list"
+    echo ""
+    echo "Opsi:"
+    echo "  -ip          IP address yang akan di-banned/unbanned/dicek"
+    echo "  -banned      Banned IP address"
+    echo "  -unbanned    Unbanned IP address"
+    echo "  -status      Cek status IP tertentu"
+    echo "  -time        Durasi ban dalam menit (opsional, default: permanen)"
+    echo "  -list        Tampilkan daftar IP yang ter-banned dengan detail"
+    echo ""
+    echo "Contoh:"
+    echo "  ipx -ip 192.168.1.100 -banned              # Ban permanen"
+    echo "  ipx -ip 192.168.1.100 -banned -time 60    # Ban selama 60 menit"
+    echo "  ipx -ip 192.168.1.100 -unbanned            # Unbanned IP"
+    echo "  ipx -ip 192.168.1.100 -status              # Cek status IP"
+    echo "  ipx -list                                   # Lihat semua IP ter-banned"
+}
+
+# Fungsi untuk validasi IP address
+validate_ip() {
+    local ip=$1
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Fungsi untuk banned IP
+ban_ip() {
+    local ip=$1
+    local duration=$2
+    
+    # Cek apakah IP sudah ter-banned
+    if iptables -L INPUT -n | grep -q "$ip"; then
+        echo "⚠️  IP $ip sudah ter-banned sebelumnya"
+        return 1
+    fi
+    
+    # Banned IP menggunakan iptables
+    iptables -A INPUT -s "$ip" -j DROP
+    
+    if [ $? -eq 0 ]; then
+        # Catat ke log
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - BANNED: $ip" >> "$BANNED_LIST"
+        
+        if [ -z "$duration" ] || [ "$duration" = "permanen" ]; then
+            echo "✅ IP $ip berhasil di-banned secara PERMANEN"
+        else
+            echo "✅ IP $ip berhasil di-banned selama $duration menit"
+            
+            # Buat job untuk unban otomatis
+            unban_time=$(date -d "+$duration minutes" '+%Y-%m-%d %H:%M:%S')
+            echo "📅 IP akan di-unbanned otomatis pada: $unban_time"
+            
+            # Tambahkan ke crontab untuk unban otomatis
+            (crontab -l 2>/dev/null; echo "$(date -d "+$duration minutes" '+%M %H %d %m') * $0 -ip $ip -unbanned # Auto-unban $ip") | crontab -
+        fi
+    else
+        echo "❌ Gagal banned IP $ip"
+        return 1
+    fi
+}
+
+# Fungsi untuk unbanned IP
+unban_ip() {
+    local ip=$1
+    
+    # Cek apakah IP ter-banned
+    if ! iptables -L INPUT -n | grep -q "$ip"; then
+        echo "⚠️  IP $ip tidak dalam daftar banned"
+        return 1
+    fi
+    
+    # Unbanned IP
+    iptables -D INPUT -s "$ip" -j DROP
+    
+    if [ $? -eq 0 ]; then
+        # Catat ke log
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - UNBANNED: $ip" >> "$BANNED_LIST"
+        echo "✅ IP $ip berhasil di-unbanned"
+        
+        # Hapus dari crontab jika ada
+        crontab -l 2>/dev/null | grep -v "Auto-unban $ip" | crontab -
+    else
+        echo "❌ Gagal unbanned IP $ip"
+        return 1
+    fi
+}
+
+# Fungsi untuk menampilkan daftar IP yang ter-banned
+list_banned() {
+    echo "📋 Daftar IP yang ter-banned:"
+    echo "================================"
+    
+    local count=0
+    local temp_file="/tmp/ipx_banned_temp"
+    
+    # Ambil daftar IP dari iptables
+    iptables -L INPUT -n -v | grep DROP | grep -v "0.0.0.0/0" | awk '{print $8}' | grep -E '^[0-9]' > "$temp_file"
+    
+    if [ ! -s "$temp_file" ]; then
+        echo "  ℹ️  Tidak ada IP yang ter-banned"
+        rm -f "$temp_file"
+        return
+    fi
+    
+    while read -r ip; do
+        if [ -n "$ip" ]; then
+            count=$((count + 1))
+            
+            # Cek apakah ada auto-unban scheduled
+            local unban_schedule=$(crontab -l 2>/dev/null | grep "Auto-unban $ip" | head -1)
+            
+            if [ -n "$unban_schedule" ]; then
+                # Parse waktu dari crontab
+                local minute=$(echo "$unban_schedule" | awk '{print $1}')
+                local hour=$(echo "$unban_schedule" | awk '{print $2}')
+                local day=$(echo "$unban_schedule" | awk '{print $3}')
+                local month=$(echo "$unban_schedule" | awk '{print $4}')
+                
+                echo "  🔴 $ip"
+                echo "     ⏰ Tipe: TEMPORARY"
+                echo "     📅 Auto-unban: Hari $day, Bulan $month, Jam $hour:$minute"
+            else
+                echo "  🔴 $ip"
+                echo "     ⏰ Tipe: PERMANEN"
+            fi
+            
+            # Cek log terakhir
+            if [ -f "$BANNED_LIST" ]; then
+                local last_log=$(grep "$ip" "$BANNED_LIST" | tail -1)
+                if [ -n "$last_log" ]; then
+                    echo "     📝 Log: $last_log"
+                fi
+            fi
+            echo ""
+        fi
+    done < "$temp_file"
+    
+    rm -f "$temp_file"
+    echo "================================"
+    echo "Total: $count IP ter-banned"
+}
+
+# Fungsi untuk cek status IP tertentu
+check_status() {
+    local ip=$1
+    
+    echo "🔍 Status IP: $ip"
+    echo "================================"
+    
+    # Cek apakah ter-banned
+    if iptables -L INPUT -n | grep -q "$ip"; then
+        echo "Status: 🔴 BANNED"
+        
+        # Cek tipe ban
+        local unban_schedule=$(crontab -l 2>/dev/null | grep "Auto-unban $ip" | head -1)
+        
+        if [ -n "$unban_schedule" ]; then
+            local minute=$(echo "$unban_schedule" | awk '{print $1}')
+            local hour=$(echo "$unban_schedule" | awk '{print $2}')
+            local day=$(echo "$unban_schedule" | awk '{print $3}')
+            local month=$(echo "$unban_schedule" | awk '{print $4}')
+            
+            echo "Tipe: ⏰ TEMPORARY"
+            echo "Auto-unban: Hari $day, Bulan $month, Jam $hour:$minute"
+        else
+            echo "Tipe: ♾️  PERMANEN"
+        fi
+        
+        # Tampilkan history dari log
+        if [ -f "$BANNED_LIST" ]; then
+            echo ""
+            echo "📜 History:"
+            grep "$ip" "$BANNED_LIST" | tail -5
+        fi
+    else
+        echo "Status: ✅ TIDAK BANNED (Normal/Allowed)"
+        
+        # Cek apakah pernah di-banned sebelumnya
+        if [ -f "$BANNED_LIST" ] && grep -q "$ip" "$BANNED_LIST"; then
+            echo ""
+            echo "📜 History (pernah di-banned):"
+            grep "$ip" "$BANNED_LIST" | tail -3
+        fi
+    fi
+    
+    echo "================================"
+}
+
+# Cek apakah script dijalankan sebagai root
+if [ "$EUID" -ne 0 ]; then
+    echo "❌ Script ini harus dijalankan sebagai root (gunakan sudo)"
+    exit 1
+fi
+
+# Parse arguments
+IP=""
+ACTION=""
+TIME=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -ip)
+            IP="$2"
+            shift 2
+            ;;
+        -banned)
+            ACTION="ban"
+            shift
+            ;;
+        -unbanned)
+            ACTION="unban"
+            shift
+            ;;
+        -status)
+            ACTION="status"
+            shift
+            ;;
+        -time)
+            TIME="$2"
+            shift 2
+            ;;
+        -list)
+            list_banned
+            exit 0
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "❌ Opsi tidak dikenal: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validasi input
+if [ -z "$IP" ] && [ -z "$ACTION" ]; then
+    show_help
+    exit 1
+fi
+
+if [ -z "$IP" ]; then
+    echo "❌ IP address harus diisi!"
+    exit 1
+fi
+
+if ! validate_ip "$IP"; then
+    echo "❌ Format IP address tidak valid: $IP"
+    exit 1
+fi
+
+if [ -z "$ACTION" ]; then
+    echo "❌ Aksi harus dipilih: -banned atau -unbanned"
+    exit 1
+fi
+
+# Eksekusi aksi
+case $ACTION in
+    ban)
+        ban_ip "$IP" "$TIME"
+        ;;
+    unban)
+        unban_ip "$IP"
+        ;;
+    status)
+        check_status "$IP"
+        ;;
+    *)
+        echo "❌ Aksi tidak valid"
+        exit 1
+        ;;
+esac
